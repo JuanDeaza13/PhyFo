@@ -1,0 +1,14 @@
+{
+  "name": "phyfo-app",
+  "version": "1.0.0",
+  "private": true,
+  "description": "PHY-FO: aplicación web básica para la compraventa de videojuegos físicos (trabajo de grado)",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18" },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.21.2",
+    "mssql": "^11.0.1"
+  }
+}
