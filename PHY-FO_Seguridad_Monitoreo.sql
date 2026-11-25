@@ -8,6 +8,7 @@
 --   Parte 2. Pruebas de integridad (reglas violadas, P01 a P26)
 --   Parte 3. Pruebas de contraseñas y de acceso por rol
 --   Parte 4. Monitoreo (indicadores de la instancia)
+--   Parte 5. Pruebas de funcionamiento (F01 a F04), fase 8
 --
 -- Nota: los rechazos consumen valores IDENTITY, por lo que pueden quedar
 -- saltos en los ID; es normal. Para volver al estado inicial, ejecute de
@@ -17,19 +18,17 @@
 -- ------------------------------------------------------------
 -- PARTE 1. CUENTAS, ROLES Y PERMISOS (mínimo privilegio)
 -- ------------------------------------------------------------
--- Las contraseñas de estas cuentas son de EJEMPLO: cámbielas por claves propias
--- antes de ejecutar (deben cumplir la política de contraseñas de SQL Server).
--- Son de prueba para el entorno local;
+-- Las contraseñas de estas cuentas son de prueba para el entorno local;
 -- en producción se guardarían fuera del script.
 
 USE master;
 GO
 IF NOT EXISTS (SELECT 1 FROM sys.server_principals WHERE name = N'phyfo_admin')
-    CREATE LOGIN phyfo_admin   WITH PASSWORD = N'CAMBIAR_Admin#2026', CHECK_POLICY = ON, DEFAULT_DATABASE = phyfo;
+    CREATE LOGIN phyfo_admin   WITH PASSWORD = N'Adm!n_PhyFo#2026', CHECK_POLICY = ON, DEFAULT_DATABASE = phyfo;
 IF NOT EXISTS (SELECT 1 FROM sys.server_principals WHERE name = N'phyfo_app')
-    CREATE LOGIN phyfo_app     WITH PASSWORD = N'CAMBIAR_App#2026x', CHECK_POLICY = ON, DEFAULT_DATABASE = phyfo;
+    CREATE LOGIN phyfo_app     WITH PASSWORD = N'App_PhyFo#2026x', CHECK_POLICY = ON, DEFAULT_DATABASE = phyfo;
 IF NOT EXISTS (SELECT 1 FROM sys.server_principals WHERE name = N'phyfo_publico')
-    CREATE LOGIN phyfo_publico WITH PASSWORD = N'CAMBIAR_Publico#2026x', CHECK_POLICY = ON, DEFAULT_DATABASE = phyfo;
+    CREATE LOGIN phyfo_publico WITH PASSWORD = N'Pub_PhyFo#2026x', CHECK_POLICY = ON, DEFAULT_DATABASE = phyfo;
 GO
 
 USE phyfo;
@@ -644,4 +643,108 @@ JOIN sys.tables t ON t.object_id = ps.object_id
 WHERE ps.index_id IN (0, 1)
 GROUP BY t.name
 ORDER BY filas DESC;
+GO
+
+-- ------------------------------------------------------------
+-- PARTE 5. PRUEBAS DE FUNCIONAMIENTO (fase 8)
+-- Cada prueba corre dentro de una transacción que se revierte al final, por
+-- lo que los datos de prueba quedan intactos, y muestra un solo resultado
+-- para poder capturarlo. Ejecutar después de las partes 1 a 4.
+--   F01 Inserción: registrar un usuario (conteo antes y después)
+--   F02 Publicación y venta: estado Disponible -> Publicado -> Vendido
+--   F03 Actualización: el administrador modifica el precio de una publicación
+--   F04 Eliminación: borrar una reseña (permitido) y un usuario con ventas
+--       (rechazado por la llave foránea, error 547)
+-- ------------------------------------------------------------
+USE phyfo;
+GO
+
+-- F01 Registrar un usuario con sp_registrar_usuario
+BEGIN TRANSACTION;
+DECLARE @id INT, @antes INT, @despues INT;
+SELECT @antes = COUNT(*) FROM dbo.Usuario;
+EXEC dbo.sp_registrar_usuario N'Usuario de prueba', N'prueba.fase8@example.com', N'Clave12345', @id OUTPUT;
+SELECT @despues = COUNT(*) FROM dbo.Usuario;
+SELECT N'F01' AS Prueba, @antes AS Usuarios_antes, @despues AS Usuarios_despues, @id AS ID_nuevo,
+       LEN(sal) AS Largo_sal, LEN(contrasena) AS Largo_hash,
+       CASE WHEN contrasena = N'Clave12345' THEN N'TEXTO PLANO' ELSE N'Con sal y hash' END AS Contrasena
+FROM dbo.Usuario WHERE ID_usuario = @id;
+ROLLBACK TRANSACTION;
+GO
+
+-- F02 Publicar un ejemplar y venderlo: el estado de vw_estado_inventario cambia
+BEGIN TRANSACTION;
+DECLARE @inv INT = (SELECT TOP 1 ID_inventario FROM dbo.vw_estado_inventario
+                    WHERE Estado = N'Disponible' ORDER BY ID_inventario);
+DECLARE @dueno INT = (SELECT ID_usuario FROM dbo.Inventario WHERE ID_inventario = @inv);
+DECLARE @comprador INT = (SELECT TOP 1 ID_usuario FROM dbo.Usuario WHERE ID_usuario <> @dueno ORDER BY ID_usuario);
+DECLARE @pub INT;
+DECLARE @e TABLE (Paso NVARCHAR(40), ID_inventario INT, Estado NVARCHAR(20));
+
+INSERT INTO @e SELECT N'1. Antes de publicar', ID_inventario, Estado FROM dbo.vw_estado_inventario WHERE ID_inventario = @inv;
+
+EXEC dbo.sp_publicar_ejemplar @inv, 150000, N'/uploads/fase8/f02-a.jpg|/uploads/fase8/f02-b.jpg';
+SELECT @pub = ID_publicacion FROM dbo.Publicacion WHERE ID_inventario = @inv;
+INSERT INTO @e SELECT N'2. Después de publicar', ID_inventario, Estado FROM dbo.vw_estado_inventario WHERE ID_inventario = @inv;
+
+EXEC dbo.sp_registrar_venta @p_publicacion = @pub, @p_comprador = @comprador, @p_precio = 150000,
+                            @p_forma_entrega = N'En persona';
+INSERT INTO @e SELECT N'3. Después de vender', ID_inventario, Estado FROM dbo.vw_estado_inventario WHERE ID_inventario = @inv;
+
+SELECT N'F02' AS Prueba, Paso, ID_inventario, Estado FROM @e ORDER BY Paso;
+ROLLBACK TRANSACTION;
+GO
+
+-- F03 El administrador actualiza el precio de una publicación sin vender
+BEGIN TRANSACTION;
+DECLARE @pub INT = (SELECT TOP 1 p.ID_publicacion FROM dbo.Publicacion p
+                    WHERE NOT EXISTS (SELECT 1 FROM dbo.Transaccion t WHERE t.ID_publicacion = p.ID_publicacion)
+                    ORDER BY p.ID_publicacion);
+DECLARE @antes DECIMAL(10,2) = (SELECT Precio FROM dbo.Publicacion WHERE ID_publicacion = @pub);
+DECLARE @filas INT;
+EXECUTE AS USER = N'u_admin';
+UPDATE dbo.Publicacion SET Precio = Precio + 5000 WHERE ID_publicacion = @pub;
+SET @filas = @@ROWCOUNT;
+REVERT;
+SELECT N'F03' AS Prueba, N'phyfo_admin' AS Cuenta, @pub AS ID_publicacion, @antes AS Precio_antes,
+       (SELECT Precio FROM dbo.Publicacion WHERE ID_publicacion = @pub) AS Precio_despues,
+       @filas AS Filas_afectadas;
+ROLLBACK TRANSACTION;
+GO
+
+-- F04 Eliminar: una reseña (permitido) y un usuario con ventas (rechazado)
+DECLARE @r TABLE (Prueba NVARCHAR(5), Operacion NVARCHAR(60), Esperado INT, Obtenido INT NULL, Mensaje NVARCHAR(300) NULL);
+DECLARE @n INT;
+
+-- F04a borrar una reseña
+BEGIN TRANSACTION;
+EXECUTE AS USER = N'u_admin';
+BEGIN TRY
+    DELETE FROM dbo.Resena WHERE ID_resena = (SELECT MIN(ID_resena) FROM dbo.Resena);
+    SET @n = @@ROWCOUNT;
+    INSERT INTO @r VALUES (N'F04a', N'Borrar una reseña', 1, @n, N'Filas eliminadas');
+END TRY
+BEGIN CATCH
+    INSERT INTO @r VALUES (N'F04a', N'Borrar una reseña', 1, NULL, ERROR_MESSAGE());
+END CATCH;
+REVERT;
+ROLLBACK TRANSACTION;
+
+-- F04b borrar un usuario que tiene ventas (FOREIGN KEY)
+BEGIN TRANSACTION;
+EXECUTE AS USER = N'u_admin';
+BEGIN TRY
+    DELETE FROM dbo.Usuario WHERE ID_usuario = (SELECT TOP 1 ID_comprador FROM dbo.Transaccion ORDER BY ID_transaccion);
+    INSERT INTO @r VALUES (N'F04b', N'Borrar un usuario con ventas', 547, NULL, N'NO RECHAZADO');
+END TRY
+BEGIN CATCH
+    INSERT INTO @r VALUES (N'F04b', N'Borrar un usuario con ventas', 547, ERROR_NUMBER(), ERROR_MESSAGE());
+END CATCH;
+REVERT;
+IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;
+
+SELECT Prueba, Operacion, Esperado, Obtenido,
+       CASE WHEN Esperado = Obtenido THEN N'OK' ELSE N'FALLA' END AS Resultado,
+       LEFT(Mensaje, 70) AS Mensaje
+FROM @r ORDER BY Prueba;
 GO
